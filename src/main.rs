@@ -1,13 +1,15 @@
 use anyhow::Result;
 
 mod prog;
-use prog::{Literal, Prog, int};
 
 use clap::Parser;
+
+use crate::prog::{Literal, Op, Op::*, Prog, bin_op, int, neg};
 
 #[derive(Debug)]
 enum DataNode {
     Constant(Literal),
+    Op(Op),
 }
 
 #[derive(Debug)]
@@ -48,7 +50,12 @@ struct Cli {
 fn main() -> Result<()> {
     let mut p = Prog::default();
 
-    p.ret(int(1));
+    // return 1 + 2 * 3 + -5;
+    p.ret(bin_op(
+        Add,
+        int(1),
+        bin_op(Add, int(1), bin_op(Mul, int(2), neg(int(5)))),
+    ));
 
     for (i, n) in p.nodes.iter().enumerate() {
         if let NodeT::DeadNode = n.t {
@@ -57,4 +64,18 @@ fn main() -> Result<()> {
         println!("node: {i} {n:?}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::prog::{Prog, int};
+
+    #[test]
+    fn basic() {
+        let mut p = Prog::default();
+
+        p.ret(int(1));
+
+        //not sure what to test here!
+    }
 }
