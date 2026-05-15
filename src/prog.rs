@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
-use crate::{ControlNode, DataNode, Node, NodeT};
+use crate::soup::{ControlNode, DataNode, Literal, Node, NodeT, Op, ScopeNode, Soup};
 
 // I'm sure that some of you will look at this file and think, why not just a parser?
 // and to that, I answer: I won't and you can't make me.
@@ -10,20 +10,6 @@ use crate::{ControlNode, DataNode, Node, NodeT};
 // and decided to either write out ASTs by hand or to do something like this.  I reserve
 // the right to change my mind and do the other stuff later, but for now the focus is on
 // the various optimization approaches to Sea-of-Nodes/Continuation-Soup-style IRs.
-
-#[derive(Debug, Clone)]
-pub enum Literal {
-    Integer(isize),
-}
-
-#[derive(Debug, Clone)]
-pub enum Op {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Neg,
-}
 
 #[derive(Debug, Clone)]
 pub struct BinOp {
@@ -39,103 +25,149 @@ pub struct UnaryOp {
 }
 
 #[derive(Debug, Clone)]
+pub struct Assign {
+    name: String,
+    val: Box<Expr>,
+}
+
+#[derive(Debug, Clone)]
 pub enum Expr {
     Literal(Literal),
     BinOp(BinOp),
     UnaryOp(UnaryOp),
+    Name(String),
+    Assign(Assign),
 }
 
 #[derive(Debug)]
 pub struct Prog {
-    pub nodes: Vec<Node>,
-    pub hash_cons: HashMap<Node, usize>,
+    soup: Soup,
+    scopes: VecDeque<HashMap<String, usize>>,
 }
 
 impl Default for Prog {
     fn default() -> Self {
-        let start = Node {
-            t: NodeT::ControlNode(ControlNode::Start),
-            inputs: vec![],
-            outputs: vec![],
+        // I don't love how we're handling current stack and current function context
+        // but presumably we'll get some direction in a chapter or two and figure out
+        // how this should actually look.
+        let start = Node::new(NodeT::ControlNode(ControlNode::Start), vec![], vec![]);
+        let mut scopes = VecDeque::new();
+        let top: HashMap<String, usize> = HashMap::new();
+        scopes.push_front(top);
+        let mut r = Self {
+            soup: Soup::new(),
+            scopes,
         };
-        Self {
-            nodes: vec![start],
-            hash_cons: HashMap::new(),
-        }
+        r.soup.insert_node(start);
+        r
     }
 }
 
 impl Prog {
-    pub fn ret(&mut self, e: Expr) -> usize {
-        let r = self.add_node(NodeT::ControlNode(ControlNode::Return), vec![e], vec![]);
+    pub fn print(self) {
+        for (i, n) in self.soup.nodes.iter().enumerate() {
+            if n.dead() {
+                continue;
+            }
+            println!("node: {i} {n:?}");
+        }
+    }
+
+    pub fn ret(&mut self, st: usize, e: Expr) -> usize {
+        // TODO: we also need to pop the scope here and wrap it up in a scope node
+        // we have to do this translation before we pop the scope, otherwise we can
+        // make the node inaccessible to the translation code.  whee oop :/
+        let ret_idx = self.expr_to_node(&e);
+        let scope = self.scopes.pop_front().expect("popping empty scope");
+        let scope_node = NodeT::ScopeNode(ScopeNode {
+            level: self.scopes.len(),
+        });
+        let inputs = scope.into_values().collect();
+        self.add_scope_node(scope_node, inputs, vec![]);
+        let r = self.add_node(NodeT::ControlNode(ControlNode::Return), vec![], vec![]);
         // this is a cheat since we don't really have functions yet, eventually a return
         // will need an input pointer to a start node
-        self.nodes[r].inputs.insert(0, 0);
+        self.soup.nodes[r].add_input(st);
+        self.soup.nodes[r].add_input(ret_idx);
         r
+    }
+    pub fn assign(&mut self, s: &str, e: Expr) {
+        let i = self.expr_to_node(&e);
+        println!("storing {s}");
+        self.scopes[0].insert(s.to_string(), i);
+    }
+
+    pub fn block(&mut self, instrs: Vec<Expr>) {
+        for i in instrs {
+            match i {
+                Expr::Assign(Assign { name, val }) => {
+                    let idx = self.expr_to_node(&val);
+                    println!("storing {name}");
+                    self.scopes[0].insert(name, idx);
+                }
+
+                _ => _ = self.expr_to_node(&i),
+            }
+        }
+    }
+
+    fn find_var(&self, name: &str) -> Option<usize> {
+        for s in self.scopes.iter().rev() {
+            match s.get(name) {
+                Some(idx) => return Some(*idx),
+                None => continue,
+            }
+        }
+        None
     }
 
     fn add_node(&mut self, t: NodeT, ins: Vec<Expr>, outs: Vec<Expr>) -> usize {
-        let inputs = ins
-            .iter()
-            .map(|e| {
-                let n = self.expr_to_node(e);
-                // memoized insertion to get the index
-                let node_idx = self.insert_node(n);
-                node_idx
-            })
-            .collect();
-        let outputs = outs
-            .iter()
-            .map(|e| {
-                let n = self.expr_to_node(e);
-                // memoized insertion to get the index
-                let node_idx = self.insert_node(n);
-                node_idx
-            })
-            .collect();
-        self.insert_node(Node { t, inputs, outputs })
+        let inputs = ins.iter().map(|e| self.expr_to_node(e)).collect();
+        let outputs = outs.iter().map(|e| self.expr_to_node(e)).collect();
+        self.soup.insert_node(Node::new(t, inputs, outputs))
     }
 
-    fn insert_node(&mut self, n: Node) -> usize {
-        self.nodes.push(n);
-        return self.nodes.len() - 1;
+    // TODO: ugh
+    fn add_scope_node(&mut self, t: NodeT, ins: Vec<usize>, outs: Vec<usize>) -> usize {
+        self.soup.insert_node(Node::new(t, ins, outs))
     }
 
-    fn expr_to_node(&mut self, e: &Expr) -> Node {
-        match e {
-            Expr::Literal(l) => Node {
-                t: NodeT::DataNode(DataNode::Constant(l.clone())),
-                inputs: vec![],
-                outputs: vec![],
-            },
+    fn expr_to_node(&mut self, e: &Expr) -> usize {
+        let n = match e {
+            Expr::Literal(l) => Node::new(
+                NodeT::DataNode(DataNode::Constant(l.clone())),
+                vec![],
+                vec![],
+            ),
             Expr::UnaryOp(UnaryOp { op, val }) => {
-                let vn = self.expr_to_node(val);
-                let v = self.insert_node(vn);
-                Node {
-                    t: NodeT::DataNode(DataNode::Op(op.clone())),
-                    inputs: vec![v],
-                    outputs: vec![],
-                }
+                let v = self.expr_to_node(val);
+                Node::new(NodeT::DataNode(DataNode::Op(op.clone())), vec![v], vec![])
             }
             Expr::BinOp(BinOp { op, lhs, rhs }) => {
-                let ln = self.expr_to_node(lhs);
-                let l = self.insert_node(ln);
+                let l = self.expr_to_node(lhs);
 
-                let rn = self.expr_to_node(rhs);
-                let r = self.insert_node(rn);
-                Node {
-                    t: NodeT::DataNode(DataNode::Op(op.clone())),
-                    inputs: vec![l, r],
-                    outputs: vec![],
+                let r = self.expr_to_node(rhs);
+                Node::new(
+                    NodeT::DataNode(DataNode::Op(op.clone())),
+                    vec![l, r],
+                    vec![],
+                )
+            }
+            Expr::Name(name) => {
+                println!("finding {name}");
+                let v = self.find_var(name).clone();
+                match v {
+                    Some(i) => return i.clone(),
+                    None => unreachable!("didn't find a var"),
                 }
             }
             _ => unimplemented!("unknown expr: {e:?}"),
-        }
+        };
+        self.soup.insert_node(n)
     }
 }
 
 // some easy constructors to make writing psuedocode a bit easier.
-
 pub fn int(i: isize) -> Expr {
     Expr::Literal(Literal::Integer(i))
 }
@@ -152,5 +184,16 @@ pub fn bin_op(o: Op, lhs: Expr, rhs: Expr) -> Expr {
         op: o,
         lhs: Box::new(lhs.clone()),
         rhs: Box::new(rhs.clone()),
+    })
+}
+
+pub fn name(s: &str) -> Expr {
+    Expr::Name(s.to_string())
+}
+
+pub fn assign(s: &str, e: Expr) -> Expr {
+    Expr::Assign(Assign {
+        name: s.to_string(),
+        val: Box::new(e),
     })
 }
